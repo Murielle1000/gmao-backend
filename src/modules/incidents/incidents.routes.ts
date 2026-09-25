@@ -43,6 +43,7 @@ const LABEL_STATUT: Record<StatutIncident, string> = {
   resolu: 'Résolu',
   enAttenteValidation: 'En attente de validation',
   cloture: 'Clôturé',
+  annule: 'Annulé',
 };
 
 function toIncidentJson(incident: Incident & { historique: ChangementStatut[] }) {
@@ -104,7 +105,14 @@ incidentsRouter.get('/', async (req: AuthenticatedRequest, res: Response) => {
 
   const where: Record<string, unknown> = {};
   if (typeof batimentId === 'string') where.batimentId = batimentId;
-  if (typeof statut === 'string') where.statut = statut;
+  // Par défaut (aucun filtre statut explicite), les incidents annulés sont
+  // exclus des listes actives — ils restent consultables via
+  // ?statut=annule ou dans l'historique/l'audit.
+  if (typeof statut === 'string') {
+    where.statut = statut;
+  } else {
+    where.statut = { not: StatutIncident.annule };
+  }
   if (typeof urgence === 'string') where.urgence = urgence;
   if (typeof technicienId === 'string') where.technicienAssigneId = technicienId;
   if (typeof signalantId === 'string') where.locataireId = signalantId;
@@ -143,10 +151,14 @@ incidentsRouter.get('/', async (req: AuthenticatedRequest, res: Response) => {
     where.locataireId = req.utilisateur!.id;
   }
 
+  // Classification chronologique (besoin remonté par l'encadrant) : les
+  // incidents/signalements les plus récents apparaissent en premier dans
+  // toutes les listes. L'urgence reste visible via le champ `urgence` sur
+  // chaque incident (badge côté mobile) mais ne sert plus de clé de tri.
   const incidents = await prisma.incident.findMany({
     where,
     include: INCLUDE_HISTORIQUE,
-    orderBy: [{ urgence: 'desc' }, { dateSignalement: 'desc' }],
+    orderBy: { dateSignalement: 'desc' },
   });
 
   res.json(incidents.map(toIncidentJson));
@@ -362,46 +374,41 @@ incidentsRouter.patch(
   },
 );
 
+// PATCH /:id/annuler — un administrateur annule un incident (signalement
+// erroné, doublon, incident réaffecté plusieurs fois sans jamais aboutir).
+// Aucune suppression en base : l'incident passe au statut « annulé »,
+// disparaît des listes actives par défaut mais reste consultable dans
+// l'historique et le journal d'audit (besoin remonté par l'encadrant).
 incidentsRouter.patch(
-  '/:id/statut',
-  requireRole('administrateur', 'technicien'),
+  '/:id/annuler',
+  requireRole('administrateur'),
   async (req: AuthenticatedRequest, res: Response) => {
-    const { statut, commentaire } = req.body as { statut?: StatutIncident; commentaire?: string };
-    if (!statut || !Object.values(StatutIncident).includes(statut)) {
-      res.status(400).json({ message: 'Statut invalide.' });
-      return;
-    }
-
-    // Validation de clôture (besoin fonctionnel locataire) : seul un
-    // administrateur peut clôturer directement un incident depuis cette
-    // route générique (cas exceptionnel, ex. locataire injoignable). Un
-    // technicien doit passer par « en attente de validation » puis
-    // laisser le locataire valider via /valider-cloture, ou le locataire
-    // peut rouvrir via /refuser-cloture.
-    if (statut === StatutIncident.cloture && req.utilisateur!.role !== 'administrateur') {
-      res.status(403).json({
-        message:
-          "Seul un administrateur peut clôturer directement un incident. Passez l'incident en « En attente de validation » pour que le locataire confirme la clôture.",
-      });
-      return;
-    }
+    const { commentaire } = req.body as { commentaire?: string };
 
     const incidentActuel = await prisma.incident.findUnique({ where: { id: req.params.id } });
     if (!incidentActuel) {
       res.status(404).json({ message: 'Incident introuvable.' });
       return;
     }
+    if (incidentActuel.statut === StatutIncident.annule) {
+      res.status(400).json({ message: 'Cet incident est déjà annulé.' });
+      return;
+    }
+    if (incidentActuel.statut === StatutIncident.cloture) {
+      res.status(400).json({ message: 'Un incident déjà clôturé ne peut pas être annulé.' });
+      return;
+    }
 
     const incident = await prisma.incident.update({
       where: { id: req.params.id },
       data: {
-        statut,
+        statut: StatutIncident.annule,
         historique: {
           create: {
-            statut,
+            statut: StatutIncident.annule,
             date: new Date(),
             auteurId: req.utilisateur!.id,
-            commentaire: commentaire ?? null,
+            commentaire: commentaire?.trim() || null,
           },
         },
       },
@@ -411,9 +418,128 @@ incidentsRouter.patch(
     await prisma.auditLogEntry.create({
       data: {
         utilisateurId: req.utilisateur!.id,
+        action: "Annulation d'un incident",
+        cible: `Incident ${req.params.id}`,
+        details: commentaire?.trim() || undefined,
+      },
+    });
+
+    await prisma.notification.create({
+      data: {
+        utilisateurId: incidentActuel.locataireId,
+        message: `Votre incident ${incidentActuel.id} a été annulé par l'administration.${
+          commentaire?.trim() ? ` Motif : ${commentaire.trim()}` : ''
+        }`,
+        incidentId: incidentActuel.id,
+      },
+    });
+
+    if (incidentActuel.technicienAssigneId) {
+      await prisma.notification.create({
+        data: {
+          utilisateurId: incidentActuel.technicienAssigneId,
+          message: `L'incident ${incidentActuel.id} qui vous était affecté a été annulé par l'administration.`,
+          incidentId: incidentActuel.id,
+        },
+      });
+    }
+
+    res.json(toIncidentJson(incident));
+  },
+);
+
+incidentsRouter.patch(
+  '/:id/statut',
+  requireRole('administrateur', 'technicien'),
+  async (req: AuthenticatedRequest, res: Response) => {
+    const { statut, commentaire } = req.body as { statut?: StatutIncident; commentaire?: string };
+    if (!statut || !Object.values(StatutIncident).includes(statut)) {
+      res.status(400).json({ message: 'Statut invalide.' });
+      return;
+    }
+    if (statut === StatutIncident.annule) {
+      res.status(400).json({ message: "Utilisez la route dédiée PATCH /:id/annuler pour annuler un incident." });
+      return;
+    }
+
+    // Validation de clôture (besoin fonctionnel locataire) : seul un
+    // administrateur peut clôturer directement un incident depuis cette
+    // route générique (cas exceptionnel, ex. locataire injoignable). Un
+    // technicien doit marquer l'incident « Résolu » — ce qui déclenche
+    // automatiquement la soumission pour validation ci-dessous — puis
+    // laisser le locataire valider via /valider-cloture, ou le locataire
+    // peut rouvrir via /refuser-cloture.
+    if (statut === StatutIncident.cloture && req.utilisateur!.role !== 'administrateur') {
+      res.status(403).json({
+        message:
+          "Seul un administrateur peut clôturer directement un incident. Marquez l'incident « Résolu » : il passera automatiquement en attente de validation du locataire.",
+      });
+      return;
+    }
+
+    const incidentActuel = await prisma.incident.findUnique({ where: { id: req.params.id } });
+    if (!incidentActuel) {
+      res.status(404).json({ message: 'Incident introuvable.' });
+      return;
+    }
+    if (incidentActuel.statut === StatutIncident.annule) {
+      res.status(400).json({ message: 'Cet incident a été annulé et ne peut plus être modifié.' });
+      return;
+    }
+
+    // Priorité à la validation du locataire (besoin remonté par
+    // l'encadrant) : la mention « Résolu » du technicien ne suffit plus,
+    // seule, à clôturer l'incident. Dès qu'un technicien (ou un
+    // administrateur) marque un incident « Résolu », celui-ci est
+    // automatiquement soumis pour validation — le locataire doit
+    // confirmer (ou refuser) avant la clôture définitive.
+    const maintenant = new Date();
+    const historiqueEntries: {
+      statut: StatutIncident;
+      date: Date;
+      auteurId: string;
+      commentaire: string | null;
+    }[] = [];
+
+    if (statut === StatutIncident.resolu) {
+      historiqueEntries.push({
+        statut: StatutIncident.resolu,
+        date: maintenant,
+        auteurId: req.utilisateur!.id,
+        commentaire: commentaire ?? null,
+      });
+      historiqueEntries.push({
+        statut: StatutIncident.enAttenteValidation,
+        date: maintenant,
+        auteurId: req.utilisateur!.id,
+        commentaire: 'Soumis automatiquement pour validation du locataire.',
+      });
+    } else {
+      historiqueEntries.push({
+        statut,
+        date: maintenant,
+        auteurId: req.utilisateur!.id,
+        commentaire: commentaire ?? null,
+      });
+    }
+
+    const statutFinal = statut === StatutIncident.resolu ? StatutIncident.enAttenteValidation : statut;
+
+    const incident = await prisma.incident.update({
+      where: { id: req.params.id },
+      data: {
+        statut: statutFinal,
+        historique: { create: historiqueEntries },
+      },
+      include: INCLUDE_HISTORIQUE,
+    });
+
+    await prisma.auditLogEntry.create({
+      data: {
+        utilisateurId: req.utilisateur!.id,
         action: 'Changement de statut',
         cible: `Incident ${req.params.id}`,
-        details: `Nouveau statut : ${LABEL_STATUT[statut]}`,
+        details: `Nouveau statut : ${LABEL_STATUT[statutFinal]}`,
       },
     });
 
@@ -421,7 +547,10 @@ incidentsRouter.patch(
     await prisma.notification.create({
       data: {
         utilisateurId: incidentActuel.locataireId,
-        message: `Le statut de votre incident ${incidentActuel.id} est passé à « ${LABEL_STATUT[statut]} ».`,
+        message:
+          statutFinal === StatutIncident.enAttenteValidation
+            ? `Le technicien a marqué votre incident ${incidentActuel.id} comme résolu. Merci de valider ou refuser la clôture depuis l'application.`
+            : `Le statut de votre incident ${incidentActuel.id} est passé à « ${LABEL_STATUT[statutFinal]} ».`,
         incidentId: incidentActuel.id,
       },
     });
